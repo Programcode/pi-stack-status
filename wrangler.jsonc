@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pi-stack-status",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "account_id": "0a0c98d989e4b1b07052014013b14e5f",
+  "workers_dev": true,
+  "kv_namespaces": [{ "binding": "STATE", "id": "396d35acdd3c463abf394096fe0c458f" }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true }
+}
