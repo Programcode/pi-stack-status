@@ -17,6 +17,17 @@ const HISTORY_LENGTH = 288; // 24 hours at one check every 5 minutes
 const BUCKETS = 48; // half-hour bars on the page
 const TIMEOUT_MS = 10_000;
 
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const escape = (value) => String(value).replace(/[&<>"']/g, (char) => ESCAPES[char]);
+
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "x-frame-options": "DENY",
+  "content-security-policy":
+    "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src https://pi-stack.org; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+
 async function check(site) {
   const started = Date.now();
   try {
@@ -27,13 +38,20 @@ async function check(site) {
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     const ok = res.status < 400;
-    return { ok, code: res.status, ms: Date.now() - started };
+    const code = res.status;
+    const ms = Date.now() - started;
+    // The body is unused. Cancel it so the connection can be reused.
+    // A null body (common for redirects) must not turn a successful check into a failure.
+    const pending = res.body?.cancel?.();
+    if (pending && typeof pending.then === "function") await pending.catch(() => {});
+    return { ok, code, ms };
   } catch (err) {
-    return { ok: false, code: 0, ms: Date.now() - started, error: err.name };
+    return { ok: false, code: 0, ms: Date.now() - started, error: err?.name || "Error" };
   }
 }
 
 async function runChecks(env) {
+  if (!env?.STATE) throw new TypeError("STATE binding is not configured");
   const results = await Promise.all(SITES.map(check));
   const state = (await env.STATE.get(STATE_KEY, "json")) ?? { sites: {} };
   const now = Date.now();
@@ -45,13 +63,15 @@ async function runChecks(env) {
   });
   state.checkedAt = now;
   await env.STATE.put(STATE_KEY, JSON.stringify(state));
+  const down = results.filter((result) => !result.ok).length;
+  console.log(JSON.stringify({ message: "checks_complete", sites: SITES.length, down }));
   return state;
 }
 
 function summarize(state) {
   return SITES.map((site) => {
     const s = state?.sites?.[site.url];
-    const history = s?.history ?? [];
+    const history = (s?.history ?? []).slice(-HISTORY_LENGTH);
     const uptime = history.length ? (history.reduce((a, b) => a + b, 0) / history.length) * 100 : null;
     const perBucket = HISTORY_LENGTH / BUCKETS;
     const padded = Array(Math.max(0, HISTORY_LENGTH - history.length)).fill(null).concat(history);
@@ -72,8 +92,6 @@ function summarize(state) {
     };
   });
 }
-
-const escape = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 function ago(ms) {
   const min = Math.round(ms / 60000);
@@ -185,23 +203,69 @@ function renderPage(state) {
 </html>`;
 }
 
+function text(body, status, extra = {}) {
+  return new Response(body, {
+    status,
+    headers: {
+      ...SECURITY_HEADERS,
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store",
+      ...extra,
+    },
+  });
+}
+
+async function loadState(env) {
+  let state = await env.STATE.get(STATE_KEY, "json");
+  if (!state) state = await runChecks(env);
+  return state;
+}
+
 export default {
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runChecks(env));
+    const job = runChecks(env).catch((err) => {
+      console.error(JSON.stringify({ message: "scheduled_check_failed", error: err?.name || "Error" }));
+      throw err;
+    });
+    ctx.waitUntil(job);
+    await job;
   },
 
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    let state = await env.STATE.get(STATE_KEY, "json");
-    if (!state) state = await runChecks(env);
+    if (pathname !== "/" && pathname !== "/api/status") return text("Not found", 404);
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return text("Method not allowed", 405, { allow: "GET, HEAD" });
+    }
+    if (!env?.STATE) return text("Status store is not configured.", 500);
+
+    let state;
+    try {
+      state = await loadState(env);
+    } catch (err) {
+      console.error(JSON.stringify({ message: "status_request_failed", error: err?.name || "Error" }));
+      return text("Status is temporarily unavailable.", 503);
+    }
 
     if (pathname === "/api/status") {
       const body = { checkedAt: state.checkedAt, sites: summarize(state).map(({ bars, ...rest }) => rest) };
-      return Response.json(body, { headers: { "cache-control": "public, max-age=30", "access-control-allow-origin": "*" } });
+      return Response.json(body, {
+        headers: {
+          ...SECURITY_HEADERS,
+          "cache-control": "public, max-age=30",
+          "access-control-allow-origin": "*",
+        },
+      });
     }
-    if (pathname !== "/") return new Response("Not found", { status: 404 });
+
     return new Response(renderPage(state), {
-      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=30" },
+      headers: {
+        ...SECURITY_HEADERS,
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "public, max-age=30",
+      },
     });
   },
 };
+
+export { BUCKETS, HISTORY_LENGTH, SITES, escape, summarize };

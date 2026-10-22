@@ -1,3 +1,13 @@
-node_modules
-.wrangler
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+*.log
+.DS_Store
 *.png
+!docs/status.png
